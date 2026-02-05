@@ -1,22 +1,24 @@
 [project]
 name = "llama-index"
 version = "0.1.0"
-description = "llama-index vector_stores GaussVector integration"
+description = "An integration package connecting GaussDB and LlamaIndex"
 authors = [
     {name = "w00840157"}
 ]
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
-    "sqlalchemy (>=1.4,<=3)",
-    "psycopg2-binary (>=2.9.0,<3.0.0)",
-    "pydantic (>=2.12.4,<3.0.0)",
-    "llama-index-core (>=0.10.1,<0.15)"
+    "numpy>=1.17.0",
+    "sqlalchemy==2.0.44",
+    "psycopg2-binary>=2.9.0",
+    "asyncpg>=0.25.0",
+    "llama-index-core>=0.10.1"
 ]
 
 [dependency-groups]
 dev = [
-    "pytest (>=9.0.1,<10.0.0)"
+    "pytest (>=8.2.2)",
+    "pytest-asyncio (>=1.3.0,<2.0.0)"
 ]
 
 [build-system]

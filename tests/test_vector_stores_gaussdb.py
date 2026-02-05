@@ -7,17 +7,20 @@ from sqlalchemy import Column, TEXT
 from llama_index.vector_stores.gaussdb import GaussVectorStore
 
 try:
-    from pygsvector import GsVecClient
+    from pygsvector import GsVecClient, AsyncGsVecClient
 
     CONN_ARGS: Dict[str, str] = {
         "uri": "10.25.106.116:6899",
         "user": "llamaindex_gv",
-        "password": "Gauss_234",
+        "password": " ",
         "db_name": "postgres",
     }
 
     # test client
     client = GsVecClient(**CONN_ARGS)
+
+    # test async client
+    aclient = AsyncGsVecClient(**CONN_ARGS)
 
     gaussdb_available = True
 except Exception as e:
@@ -32,7 +35,9 @@ from llama_index.core.schema import (
 from llama_index.core.vector_stores.types import (
     MetadataFilter,
     MetadataFilters,
-    VectorStoreQuery, VectorStoreQueryMode, FilterOperator,
+    VectorStoreQuery,
+    VectorStoreQueryMode,
+    FilterOperator,
 )
 
 ADA_TOKEN_COUNT = 1024
@@ -96,10 +101,19 @@ def test_class():
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
-def test_init_client():
+def test_init_by_from_params(node_embeddings: List[TextNode]):
     client = GsVecClient(**CONN_ARGS)
 
-    # Initialize GaussVectorStore
+    gaussdb = GaussVectorStore.from_params(
+        client=client,
+        dim=1024,
+    )
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+def test_init_with_default_config():
+    client = GsVecClient(**CONN_ARGS)
+
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -107,34 +121,27 @@ def test_init_client():
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
-def test_init_client_from_params(node_embeddings: List[TextNode]):
+def test_init_with_all_params(node_embeddings: List[TextNode]):
     client = GsVecClient(**CONN_ARGS)
+    aclient = AsyncGsVecClient(**CONN_ARGS)
 
-    # Initialize GaussVectorStore
-    gaussdb = GaussVectorStore.from_params(
-        client=client,
-        dim=1024,
-    )
-
-
-@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
-def test_init_client_all_params(node_embeddings: List[TextNode]):
-    client = GsVecClient(**CONN_ARGS)
-
-    # Initialize GaussVectorStore
     gaussdb = GaussVectorStore.from_params(
         client=client,
         dim=1024,
         table_name="test_llama_vector",
         vidx_metric_type="cosine",
         vidx_config={
-            "pq_nseg": 128,
+            "pq_nseg": 1,
             "pq_nclus": 16,
-            "num_parallels": 50,
+            "queue_size": 100,
+            "num_parallels": 10,
+            "using_clustering_for_parallel": False,
+            "lambda_for_balance": 0.00001,
             "enable_pq": True,
-            "using_clustering_for_parallel": False
+            "subgraph_count": 0
         },
         drop_old=True,
+        aclient=aclient,
         primary_field="test_id",
         doc_id_field="test_doc_id",
         text_field="test_text",
@@ -170,15 +177,29 @@ def test_add_node(node_embeddings: List[TextNode]):
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+@pytest.mark.asyncio
+async def test_async_add_node(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
+    )
+
+    await gaussdb.async_add(node_embeddings)
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
 def test_search_with_cosine_distance(node_embeddings: List[TextNode]):
     client = GsVecClient(**CONN_ARGS)
 
-    # Initialize GaussVectorStore
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
         drop_old=True,
         normalize=True,
+        vidx_metric_type="cosine",
     )
 
     gaussdb.add(node_embeddings)
@@ -194,12 +215,36 @@ def test_search_with_cosine_distance(node_embeddings: List[TextNode]):
     assert result.similarities is not None and result.similarities[0] == 1.0
     assert result.ids is not None and result.ids[0] == node_embeddings[0].node_id
 
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+@pytest.mark.asyncio
+async def test_async_search_with_cosine_distance(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
+        vidx_metric_type="cosine",
+    )
+
+    await gaussdb.async_add(node_embeddings)
+
+    q = VectorStoreQuery(query_embedding=text_to_embedding("foo"), similarity_top_k=1)
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 1
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[0].text
+    )
+    assert result.similarities is not None and result.similarities[0] == 1.0
+    assert result.ids is not None and result.ids[0] == node_embeddings[0].node_id
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
 def test_search_with_l2_distance(node_embeddings: List[TextNode]):
     client = GsVecClient(**CONN_ARGS)
 
-    # Initialize GaussVectorStore
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -225,12 +270,38 @@ def test_search_with_l2_distance(node_embeddings: List[TextNode]):
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
-def test_delete_doc(node_embeddings: List[TextNode]):
-    client = GsVecClient(
-        **CONN_ARGS,
+@pytest.mark.asyncio
+async def test_async_search_with_l2_distance(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
+        vidx_metric_type="l2",
     )
 
-    # Initialize GaussVectorStore
+    await gaussdb.async_add(node_embeddings)
+
+    q = VectorStoreQuery(query_embedding=text_to_embedding("foo"), similarity_top_k=1)
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 1
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[0].text
+    )
+    assert (
+        result.similarities is not None and result.similarities[0] == 1.0
+    )
+    assert result.ids is not None and result.ids[0] == node_embeddings[0].node_id
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+def test_delete_doc(node_embeddings: List[TextNode]):
+    client = GsVecClient(**CONN_ARGS)
+
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -269,12 +340,51 @@ def test_delete_doc(node_embeddings: List[TextNode]):
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
-def test_delete_nodes_and_get_nodes(node_embeddings: List[TextNode]):
-    client = GsVecClient(
-        **CONN_ARGS,
+@pytest.mark.asyncio
+async def test_async_delete_doc(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
+        vidx_metric_type="l2",
     )
 
-    # Initialize GaussVectorStore
+    await gaussdb.async_add(node_embeddings)
+
+    q = VectorStoreQuery(query_embedding=text_to_embedding("foo"), similarity_top_k=3)
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 3
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[0].text
+    )
+    assert result.similarities is not None and result.similarities[0] == 1.0
+    assert result.ids is not None and result.ids[0] == node_embeddings[0].node_id
+
+    await gaussdb.adelete(ref_doc_id="test-1")
+
+    q = VectorStoreQuery(query_embedding=text_to_embedding("baz"), similarity_top_k=3)
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 1
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[2].text
+    )
+    assert (
+        result.similarities is not None and result.similarities[0] == 1.0
+    )
+    assert result.ids is not None and result.ids[0] == node_embeddings[2].node_id
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+def test_delete_nodes_and_get_nodes(node_embeddings: List[TextNode]):
+    client = GsVecClient(**CONN_ARGS)
+
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -326,12 +436,64 @@ def test_delete_nodes_and_get_nodes(node_embeddings: List[TextNode]):
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
-def test_clear(node_embeddings: List[TextNode]):
-    client = GsVecClient(
-        **CONN_ARGS,
+@pytest.mark.asyncio
+async def test_async_delete_nodes_and_get_nodes(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
     )
 
-    # Initialize GaussVectorStore
+    await gaussdb.async_add(node_embeddings)
+
+    result = await gaussdb.aget_nodes()
+    assert len(result) == 3
+
+    result = await gaussdb.aget_nodes(
+        node_ids=[
+            node_embeddings[1].id_,
+            node_embeddings[2].id_,
+        ],
+        filters=MetadataFilters(
+            filters=[
+                MetadataFilter(key="location", value=2, operator=">"),
+            ]
+        ),
+    )
+    assert len(result) == 1
+
+    await gaussdb.adelete_nodes(
+        node_ids=[
+            node_embeddings[1].id_,
+            node_embeddings[2].id_,
+        ],
+        filters=MetadataFilters(
+            filters=[
+                MetadataFilter(key="location", value=2, operator=">"),
+            ]
+        ),
+    )
+    result = await gaussdb.aget_nodes(
+        node_ids=[
+            node_embeddings[0].id_,
+            node_embeddings[1].id_,
+            node_embeddings[2].id_,
+        ],
+    )
+    assert len(result) == 2
+    assert (
+        result[0].id_ == node_embeddings[0].id_
+        and result[1].id_ == node_embeddings[1].id_
+    )
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+def test_clear(node_embeddings: List[TextNode]):
+    client = GsVecClient(**CONN_ARGS)
+
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -344,12 +506,25 @@ def test_clear(node_embeddings: List[TextNode]):
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
-def test_search_with_filter(node_embeddings: List[TextNode]):
-    client = GsVecClient(
-        **CONN_ARGS,
+@pytest.mark.asyncio
+async def test_async_clear(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
     )
 
-    # Initialize GaussVectorStore
+    await gaussdb.async_add(node_embeddings)
+    await gaussdb.aclear()
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+def test_search_with_filter(node_embeddings: List[TextNode]):
+    client = GsVecClient(**CONN_ARGS)
+
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -440,7 +615,7 @@ def test_search_with_filter(node_embeddings: List[TextNode]):
             similarity_top_k=3,
             filters=MetadataFilters(
                 filters=[
-                    MetadataFilter(key="tags", value=["report"], operator="contains"),
+                    MetadataFilter(key="tags", value="report", operator="contains"),
                 ]
             ),
         )
@@ -525,10 +700,188 @@ def test_search_with_filter(node_embeddings: List[TextNode]):
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+@pytest.mark.asyncio
+async def test_async_search_with_filter(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
+    )
+
+    await gaussdb.async_add(node_embeddings)
+
+    # >=
+    q = VectorStoreQuery(
+        query_embedding=text_to_embedding("foo"),
+        similarity_top_k=3,
+        filters=MetadataFilters(
+            filters=[
+                MetadataFilter(key="location", value=2, operator=">="),
+            ]
+        ),
+    )
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 2
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[1].text
+        and result.nodes[1].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[2].text
+    )
+
+    if hasattr(FilterOperator, "ANY"):
+        # in
+        q = VectorStoreQuery(
+            query_embedding=text_to_embedding("foo"),
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(key="theme", value=["FOO", "BAR"], operator="in"),
+                ]
+            ),
+        )
+
+        result = await gaussdb.aquery(q)
+        assert result.nodes is not None and len(result.nodes) == 2
+        assert (
+            result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+            == node_embeddings[0].text
+            and result.nodes[1].get_content(metadata_mode=MetadataMode.NONE)
+            == node_embeddings[1].text
+        )
+
+        # any
+        q = VectorStoreQuery(
+            query_embedding=text_to_embedding("foo"),
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(key="theme", value=["FOO", "BAR"], operator="any"),
+                ]
+            ),
+        )
+
+        result = await gaussdb.aquery(q)
+        assert result.nodes is not None and len(result.nodes) == 2
+        assert (
+            result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+            == node_embeddings[0].text
+            and result.nodes[1].get_content(metadata_mode=MetadataMode.NONE)
+            == node_embeddings[1].text
+        )
+
+        # text_match
+        q = VectorStoreQuery(
+            query_embedding=text_to_embedding("foo"),
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(key="theme", value="BA", operator="text_match"),
+                ]
+            ),
+        )
+
+        result = await gaussdb.aquery(q)
+        assert result.nodes is not None and len(result.nodes) == 2
+
+        # contains
+        q = VectorStoreQuery(
+            query_embedding=text_to_embedding("foo"),
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(key="tags", value="report", operator="contains"),
+                ]
+            ),
+        )
+
+        result = await gaussdb.aquery(q)
+        assert result.nodes is not None and len(result.nodes) == 2
+        assert (
+            result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+            == node_embeddings[0].text
+        )
+
+        # is_empty
+        q = VectorStoreQuery(
+            query_embedding=text_to_embedding("foo"),
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(key="theme", value=None, operator="is_empty"),
+                ]
+            ),
+        )
+
+        result = await gaussdb.aquery(q)
+        assert result.nodes is not None and len(result.nodes) == 0
+
+        q = VectorStoreQuery(
+            query_embedding=text_to_embedding("foo"),
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(key="labels", value=None, operator="is_empty"),
+                ]
+            ),
+        )
+
+        result = await gaussdb.aquery(q)
+        assert result.nodes is not None and len(result.nodes) == 3
+
+    # and
+    q = VectorStoreQuery(
+        query_embedding=text_to_embedding("foo"),
+        similarity_top_k=3,
+        filters=MetadataFilters(
+            filters=[
+                MetadataFilter(key="location", value=2, operator=">="),
+                MetadataFilter(key="theme", value="BAZ", operator="=="),
+            ],
+            condition="and",
+        ),
+    )
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 1
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[2].text
+    )
+
+    # or
+    q = VectorStoreQuery(
+        query_embedding=text_to_embedding("foo"),
+        similarity_top_k=3,
+        filters=MetadataFilters(
+            filters=[
+                MetadataFilter(key="location", value=2, operator=">="),
+                MetadataFilter(key="theme", value="FOO", operator="=="),
+            ],
+            condition="or",
+        ),
+    )
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 3
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[0].text
+        and result.nodes[1].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[1].text
+        and result.nodes[2].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[2].text
+    )
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
 def test_sparse_query(node_embeddings: List[TextNode]):
     client = GsVecClient(**CONN_ARGS)
 
-    # Initialize GaussVectorStore
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -553,10 +906,37 @@ def test_sparse_query(node_embeddings: List[TextNode]):
 
 
 @pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+@pytest.mark.asyncio
+async def test_async_sparse_query(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
+        enable_sparse=True,
+    )
+
+    await gaussdb.async_add(node_embeddings)
+
+    q = VectorStoreQuery(
+        sparse_top_k=3,
+        query_str="foo",
+        mode=VectorStoreQueryMode.TEXT_SEARCH,
+    )
+
+    result = await gaussdb.aquery(q)
+    assert result.nodes is not None and len(result.nodes) == 1
+    assert result.nodes[0].get_content(metadata_mode=MetadataMode.NONE) == node_embeddings[0].text
+    assert result.similarities is not None and result.similarities[0] == pytest.approx(1.0, abs=0.05)
+    assert result.ids is not None and result.ids[0] == node_embeddings[0].node_id
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
 def test_hybrid_query(node_embeddings: List[TextNode]):
     client = GsVecClient(**CONN_ARGS)
 
-    # Initialize GaussVectorStore
     gaussdb = GaussVectorStore(
         client=client,
         dim=1024,
@@ -576,6 +956,47 @@ def test_hybrid_query(node_embeddings: List[TextNode]):
     )
 
     result = gaussdb.query(q)
+    assert result.nodes is not None and len(result.nodes) == 2
+    assert (
+        result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[0].text
+        and result.nodes[1].get_content(metadata_mode=MetadataMode.NONE)
+        == node_embeddings[2].text
+    )
+    assert (
+        result.similarities is not None and result.similarities[0] == 1
+        and result.similarities[1] == pytest.approx(1.0, abs=0.05)
+    )
+    assert (
+       result.ids is not None and result.ids[0] == node_embeddings[0].node_id
+       and result.ids[1] == node_embeddings[2].node_id
+    )
+
+
+@pytest.mark.skipif(not gaussdb_available, reason="gaussdb is not available")
+@pytest.mark.asyncio
+async def test_async_hybrid_query(node_embeddings: List[TextNode]):
+    aclient = AsyncGsVecClient(**CONN_ARGS)
+
+    gaussdb = GaussVectorStore(
+        aclient=aclient,
+        dim=1024,
+        drop_old=True,
+        normalize=True,
+        enable_sparse=True,
+    )
+
+    await gaussdb.async_add(node_embeddings)
+
+    q = VectorStoreQuery(
+        query_embedding=text_to_embedding("foo"),
+        similarity_top_k=1,
+        sparse_top_k=1,
+        query_str="baz",
+        mode=VectorStoreQueryMode.HYBRID,
+    )
+
+    result = await gaussdb.aquery(q)
     assert result.nodes is not None and len(result.nodes) == 2
     assert (
         result.nodes[0].get_content(metadata_mode=MetadataMode.NONE)

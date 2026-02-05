@@ -11,7 +11,8 @@ from llama_index.core.vector_stores.types import (
     MetadataFilters,
     FilterOperator,
     VectorStoreQuery,
-    VectorStoreQueryResult, VectorStoreQueryMode,
+    VectorStoreQueryResult,
+    VectorStoreQueryMode,
 )
 from llama_index.core.vector_stores.utils import (
     metadata_dict_to_node,
@@ -22,13 +23,22 @@ from llama_index.core.bridge.pydantic import PrivateAttr
 from sqlalchemy import Column, JSON, text, func, TEXT
 from sqlalchemy.dialects.postgresql import JSONB
 
-from pygsvector import GsVecClient, FLOATVECTOR, BM25IndexParam
+from pygsvector import GsVecClient, FLOATVECTOR, AsyncGsVecClient, IndexType
 
 DEFAULT_GAUSS_BATCH_SIZE = 100
 DEFAULT_GAUSS_VECTOR_TABLE_NAME = "llama_vector"
 DEFAULT_GAUSS_VECTOR_METRIC_TYPE = "cosine"
-DEFAULT_GAUSS_VECTOR_INDEX_TYPE = "gsdiskann"
-DEFAULT_GAUSS_VECTOR_INDEX_PARAM = {"enable_pq": True, "quantization_type": "lvq", "subgraph_count": 1}
+DEFAULT_GAUSS_VECTOR_INDEX_TYPE = IndexType.GSDISKANN
+DEFAULT_GAUSS_VECTOR_INDEX_PARAM = {
+    "pq_nseg": 1,
+    "pq_nclus": 16,
+    "queue_size": 100,
+    "num_parallels": 10,
+    "using_clustering_for_parallel": False,
+    "lambda_for_balance": 0.00001,
+    "enable_pq": True,
+    "subgraph_count": 0
+}
 
 DEFAULT_GAUSS_PRIMARY_FIELD = "id"
 DEFAULT_GAUSS_DOCID_FIELD = "doc_id"
@@ -38,7 +48,9 @@ DEFAULT_GAUSS_VEC_FIELD = "embedding"
 
 DEFAULT_GAUSS_VEC_INDEX_NAME = f"{DEFAULT_GAUSS_VECTOR_TABLE_NAME}_index"
 DEFAULT_GAUSS_SPARSE_INDEX_NAME = f"{DEFAULT_GAUSS_VECTOR_TABLE_NAME}_bm25_index"
-DEFAULT_GAUSS_SPARSE_INDEX_PARAM = {"num_parallels": 16}
+DEFAULT_GAUSS_SPARSE_INDEX_PARAM = {
+    "num_parallels": 16
+}
 
 
 class DBEmbeddingRow(NamedTuple):
@@ -91,11 +103,13 @@ class GaussVectorStore(BasePydanticVectorStore):
     stores_text: bool = True
 
     _client: GsVecClient = PrivateAttr()
+    _aclient: AsyncGsVecClient = PrivateAttr()
     _dim: int = PrivateAttr()
     _table_name: str = PrivateAttr()
     _vidx_metric_type: str = PrivateAttr()
     _vidx_config: Optional[dict] = PrivateAttr()
-    _vidx_type: str = PrivateAttr()
+    _drop_old: Optional[bool] = PrivateAttr()
+    _vidx_type: IndexType = PrivateAttr()
     _primary_field: str = PrivateAttr()
     _doc_id_field: str = PrivateAttr()
     _text_field: str = PrivateAttr()
@@ -110,16 +124,18 @@ class GaussVectorStore(BasePydanticVectorStore):
     _sparse_field: str = PrivateAttr()
     _sparse_idx_name: str = PrivateAttr()
     _sparse_idx_config: Optional[dict] = PrivateAttr()
+    _is_async_init: bool = PrivateAttr()
 
     def __init__(
         self,
-        client: GsVecClient,
         dim: int,
         table_name: str = DEFAULT_GAUSS_VECTOR_TABLE_NAME,
         vidx_metric_type: str = DEFAULT_GAUSS_VECTOR_METRIC_TYPE,
         vidx_config: Optional[dict] = None,
         drop_old: bool = False,
         *,
+        client: Optional[GsVecClient] = None,
+        aclient: Optional[AsyncGsVecClient] = None,
         primary_field: str = DEFAULT_GAUSS_PRIMARY_FIELD,
         doc_id_field: str = DEFAULT_GAUSS_DOCID_FIELD,
         text_field: str = DEFAULT_GAUSS_DOC_FIELD,
@@ -140,6 +156,7 @@ class GaussVectorStore(BasePydanticVectorStore):
 
         Args:
             client (GsVecClient): GaussDB vector client instance.
+            aclient (AsyncGsVecClient): Async GaussDB vector client instance.
             dim (int): Dimension of embedding vector.
             table_name (str): Table name. Defaults to "llama_vector".
             vidx_metric_type (str): Metric method of distance between vectors.
@@ -166,7 +183,12 @@ class GaussVectorStore(BasePydanticVectorStore):
         """
         super().__init__()
 
+        if client is None and aclient is None:
+            raise ValueError("Either client or aclient should be provided.")
+
         self._client = client
+        self._aclient = aclient
+
         self._dim = dim
         self._table_name = table_name
         self._vidx_metric_type = vidx_metric_type
@@ -174,6 +196,7 @@ class GaussVectorStore(BasePydanticVectorStore):
             raise ValueError(f"vidx_metric_type should be l2 or cosine. ")
         self._vidx_type = DEFAULT_GAUSS_VECTOR_INDEX_TYPE
         self._vidx_config = vidx_config or DEFAULT_GAUSS_VECTOR_INDEX_PARAM
+        self._drop_old = drop_old
 
         self._primary_field = primary_field
         self._doc_id_field = doc_id_field
@@ -191,13 +214,16 @@ class GaussVectorStore(BasePydanticVectorStore):
         self._sparse_idx_name = sparse_idx_name
         self._sparse_idx_config = sparse_idx_config or DEFAULT_GAUSS_SPARSE_INDEX_PARAM
 
-        if drop_old:
-            self._client.drop_table_if_exist(table_name=self._table_name)
+        self._is_async_init = False
 
-        self._create_table_with_index()
+        if self._client is not None:
+            self._create_table_with_index()
 
     def _create_table_with_index(self):
         """Create table and create index."""
+        if self._drop_old:
+            self._client.drop_table_if_exist(table_name=self._table_name)
+
         if self._client.check_table_exists(self._table_name):
             logger.info(f"table {self._table_name} already exists, skip")
             return
@@ -214,8 +240,8 @@ class GaussVectorStore(BasePydanticVectorStore):
         if self._extra_columns:
             cols.extend(self._extra_columns)
 
-        vidx_params = self._client.prepare_index_params()
-        vidx_params.add_index(
+        index_params = self._client.prepare_index_params()
+        index_params.add_index(
             field_name=self._vector_field,
             index_type=self._vidx_type,
             index_name=self._vidx_name,
@@ -223,24 +249,75 @@ class GaussVectorStore(BasePydanticVectorStore):
             params=self._vidx_config
         )
 
-        bm25_idx_params = None
         if self._enable_sparse:
-            bm25_idx_params = [
-                BM25IndexParam(
-                    index_name=self._sparse_idx_name,
-                    field_names=[self._sparse_field],
-                    num_parallels=self._sparse_idx_config.get("num_parallels", 16)
-                )
-            ]
+            index_params.add_index(
+                field_name=self._sparse_field,
+                index_type=IndexType.BM25,
+                index_name=self._sparse_idx_name,
+                num_parallels=self._sparse_idx_config.get("num_parallels", 16)
+            )
 
         self._client.create_table_with_index_params(
             table_name=self._table_name,
             columns=cols,
             indexes=None,
-            vidxs=vidx_params,
-            bm25_idxs=bm25_idx_params,
+            index_params=index_params,
             partitions=self._partitions,
         )
+
+    async def _acreate_table_with_index(self):
+        """Create table and create index."""
+        if self._aclient is None:
+            raise ValueError("Async client should be initialized.")
+
+        if self._drop_old:
+            await self._aclient.drop_table_if_exist(table_name=self._table_name)
+
+        if await self._aclient.check_table_exists(self._table_name):
+            logger.info(f"table {self._table_name} already exists, skip")
+            return
+
+        metadata_dtype = JSONB if self._use_jsonb else JSON
+
+        cols = [
+            Column(self._primary_field, TEXT, primary_key=True, autoincrement=False),
+            Column(self._doc_id_field, TEXT),
+            Column(self._text_field, TEXT),
+            Column(self._metadata_field, metadata_dtype),
+            Column(self._vector_field, FLOATVECTOR(self._dim)),
+        ]
+        if self._extra_columns:
+            cols.extend(self._extra_columns)
+
+        index_params = self._aclient.prepare_index_params()
+        index_params.add_index(
+            field_name=self._vector_field,
+            index_type=self._vidx_type,
+            index_name=self._vidx_name,
+            metric_type=self._vidx_metric_type,
+            params=self._vidx_config
+        )
+
+        if self._enable_sparse:
+            index_params.add_index(
+                field_name=self._sparse_field,
+                index_type=IndexType.BM25,
+                index_name=self._sparse_idx_name,
+                num_parallels=self._sparse_idx_config.get("num_parallels", 16)
+            )
+
+        await self._aclient.create_table_with_index_params(
+            table_name=self._table_name,
+            columns=cols,
+            indexes=None,
+            index_params=index_params,
+            partitions=self._partitions,
+        )
+
+    async def _async_init(self):
+        if not self._is_async_init:
+            await self._acreate_table_with_index()
+            self._is_async_init = True
 
     @staticmethod
     def _to_gauss_operator(operator: FilterOperator) -> str:
@@ -321,10 +398,9 @@ class GaussVectorStore(BasePydanticVectorStore):
                     f"{self._to_gauss_operator(filter.operator)} '%{filter.value}%'"
                 )
             elif filter.operator == FilterOperator.CONTAINS:
-                filter_value = ",".join(f"\"{v}\"" for v in filter.value)
                 filters.append(
                     f"{self._metadata_field}::jsonb->'{filter.key}' "
-                    f"{self._to_gauss_operator(filter.operator)} '[{filter_value}]'"
+                    f"{self._to_gauss_operator(filter.operator)} '[\"{filter.value}\"]'"
                 )
             elif filter.operator == FilterOperator.IS_EMPTY:
                 filters.append(
@@ -332,9 +408,9 @@ class GaussVectorStore(BasePydanticVectorStore):
                     f"{self._to_gauss_operator(filter.operator)}"
                 )
             else:
-                raise ValueError(
-                    f"Operator {filter.operator} is not supported by GaussDB"
-                )
+                msg = f"Operator {filter.operator} is not supported by GaussDB"
+                logger.error(msg)
+                raise ValueError(msg)
         return f" {metadata_filters.condition.value} ".join(filters)
 
     def _parse_metric_type_str_to_dist_func(self) -> Any:
@@ -369,13 +445,14 @@ class GaussVectorStore(BasePydanticVectorStore):
     @classmethod
     def from_params(
         cls,
-        client: GsVecClient,
         dim: int,
         table_name: str = DEFAULT_GAUSS_VECTOR_TABLE_NAME,
         vidx_metric_type: str = DEFAULT_GAUSS_VECTOR_METRIC_TYPE,
         vidx_config: Optional[dict] = None,
         drop_old: bool = False,
         *,
+        client: Optional[GsVecClient] = None,
+        aclient: Optional[AsyncGsVecClient] = None,
         primary_field: str = DEFAULT_GAUSS_PRIMARY_FIELD,
         doc_id_field: str = DEFAULT_GAUSS_DOCID_FIELD,
         text_field: str = DEFAULT_GAUSS_DOC_FIELD,
@@ -395,6 +472,7 @@ class GaussVectorStore(BasePydanticVectorStore):
 
         Args:
             client (GsVecClient): GaussDB vector client instance.
+            aclient (AsyncGsVecClient): Async GaussDB vector client instance.
             dim (int): Dimension of embedding vector.
             table_name (str): Table name. Defaults to "llama_vector".
             vidx_metric_type (str): Metric method of distance between vectors.
@@ -429,6 +507,7 @@ class GaussVectorStore(BasePydanticVectorStore):
             vidx_metric_type=vidx_metric_type,
             vidx_config=vidx_config,
             drop_old=drop_old,
+            aclient=aclient,
             primary_field=primary_field,
             doc_id_field=doc_id_field,
             text_field=text_field,
@@ -454,6 +533,11 @@ class GaussVectorStore(BasePydanticVectorStore):
         """Get client."""
         return self._client
 
+    @property
+    def aclient(self) -> Any:
+        """Get async client."""
+        return self._aclient
+
     def get_nodes(
         self,
         node_ids: Optional[List[str]] = None,
@@ -472,12 +556,46 @@ class GaussVectorStore(BasePydanticVectorStore):
             List[BaseNode]: List of text nodes.
 
         """
+        if self._client is None:
+            raise ValueError("Client should be initialized.")
+
         if filters is not None:
             filter = self._to_gauss_filter(filters)
         else:
             filter = None
 
         res = self._client.get(
+            table_name=self._table_name,
+            ids=node_ids,
+            where_clause=[text(filter)] if filter is not None else None,
+            output_column_names=[self._text_field, self._metadata_field],
+        )
+
+        return [
+            metadata_dict_to_node(
+                metadata=(json.loads(r[1]) if not isinstance(r[1], dict) else r[1]),
+                text=r[0],
+            )
+            for r in res.fetchall()
+        ]
+
+    async def aget_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None
+    ) -> List[BaseNode]:
+        """Asynchronously get nodes from vector store."""
+        if self._aclient is None:
+            raise ValueError("Async client should be initialized.")
+
+        await self._async_init()
+
+        if filters is not None:
+            filter = self._to_gauss_filter(filters)
+        else:
+            filter = None
+
+        res = await self._aclient.get(
             table_name=self._table_name,
             ids=node_ids,
             where_clause=[text(filter)] if filter is not None else None,
@@ -511,6 +629,9 @@ class GaussVectorStore(BasePydanticVectorStore):
             List[str]: List of ids inserted.
 
         """
+        if self._client is None:
+            raise ValueError("Client should be initialized.")
+
         batch_size = batch_size or DEFAULT_GAUSS_BATCH_SIZE
 
         extra_data = extras or [{} for _ in nodes]
@@ -540,6 +661,47 @@ class GaussVectorStore(BasePydanticVectorStore):
 
         return [node.id_ for node in nodes]
 
+    async def async_add(
+        self,
+        nodes: List[BaseNode],
+        batch_size: Optional[int] = None,
+        extras: Optional[List[dict]] = None
+    ) -> List[str]:
+        """ Asynchronously add nodes with embedding to vector store."""
+        if self._aclient is None:
+            raise ValueError("Async client should be initialized.")
+
+        await self._async_init()
+
+        batch_size = batch_size or DEFAULT_GAUSS_BATCH_SIZE
+
+        extra_data = extras or [{} for _ in nodes]
+        if len(nodes) != len(extra_data):
+            error_msg = "length of extras should be the same as nodes."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        data = [
+            {
+                self._primary_field: node.id_,
+                self._doc_id_field: node.ref_doc_id or None,
+                self._text_field: node.get_content(metadata_mode=MetadataMode.NONE),
+                self._metadata_field: node_to_metadata_dict(node, remove_text=True),
+                self._vector_field: (
+                    node.get_embedding()
+                    if not self._normalize
+                    else _normalize(node.get_embedding())
+                ),
+                **extra,
+            }
+            for node, extra in zip(nodes, extra_data)
+        ]
+
+        for data_batch in iter_batch(data, batch_size):
+            await self._aclient.insert(table_name=self._table_name, data=data_batch)
+
+        return [node.id_ for node in nodes]
+
     def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         """
         Delete nodes using with ref_doc_id.
@@ -548,7 +710,28 @@ class GaussVectorStore(BasePydanticVectorStore):
             ref_doc_id (str): The doc_id of the document to delete.
 
         """
+        if self._client is None:
+            raise ValueError("Client should be initialized.")
+
         self._client.delete(
+            table_name=self._table_name,
+            where_clause=[text(f"{self._doc_id_field} = '{ref_doc_id}'")]
+        )
+
+    async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        """
+        Asynchronously delete nodes using with ref_doc_id.
+
+        Args:
+            ref_doc_id (str): The doc_id of the document to delete.
+
+        """
+        if self._aclient is None:
+            raise ValueError("Async client should be initialized.")
+
+        await self._async_init()
+
+        await self._aclient.delete(
             table_name=self._table_name,
             where_clause=[text(f"{self._doc_id_field} = '{ref_doc_id}'")]
         )
@@ -569,6 +752,9 @@ class GaussVectorStore(BasePydanticVectorStore):
                 Defaults to None.
 
         """
+        if self._client is None:
+            raise ValueError("Client should be initialized.")
+
         if filters is not None:
             filter = self._to_gauss_filter(filters)
         else:
@@ -580,9 +766,53 @@ class GaussVectorStore(BasePydanticVectorStore):
             where_clause=[text(filter)] if filter is not None else None
         )
 
+    async def adelete_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+        **delete_kwargs: Any
+    ) -> None:
+        """
+        Asynchronously deletes nodes from vector store.
+
+        Args:
+            node_ids (Optional[List[str]], optional): IDs of nodes to delete.
+                Defaults to None.
+            filters (Optional[MetadataFilters], optional): Metadata filters.
+                Defaults to None.
+
+        """
+        if self._aclient is None:
+            raise ValueError("Async client should be initialized.")
+
+        await self._async_init()
+
+        if filters is not None:
+            filter = self._to_gauss_filter(filters)
+        else:
+            filter = None
+
+        await self._aclient.delete(
+            table_name=self._table_name,
+            ids=node_ids,
+            where_clause=[text(filter)] if filter is not None else None
+        )
+
     def clear(self) -> None:
         """Clear all nodes from configured vector store."""
+        if self._client is None:
+            raise ValueError("Client should be initialized.")
+
         self._client.perform_raw_text_sql(f"TRUNCATE TABLE {self._table_name}")
+
+    async def aclear(self) -> None:
+        """Asynchronously clear all nodes from configured vector store."""
+        if self._aclient is None:
+            raise ValueError("Async client should be initialized.")
+
+        await self._async_init()
+
+        await self._aclient.perform_raw_text_sql(f"TRUNCATE TABLE {self._table_name}")
 
     @staticmethod
     def _dedup_results(results: List[DBEmbeddingRow]) -> List[DBEmbeddingRow]:
@@ -651,6 +881,42 @@ class GaussVectorStore(BasePydanticVectorStore):
             for r in res.fetchall()
         ]
 
+    async def _adefault_search(self, query: VectorStoreQuery, **kwargs: Any) -> List[DBEmbeddingRow]:
+        """Asynchronously perform default search: dense embedding search."""
+        if query.filters is not None:
+            filter = self._to_gauss_filter(query.filters)
+        else:
+            filter = None
+
+        res = await self._aclient.ann_search(
+            table_name=self._table_name,
+            vec_data=(
+                query.query_embedding
+                if not self._normalize
+                else _normalize(query.query_embedding)
+            ),
+            vec_column_name=self._vector_field,
+            distance_func=self._parse_metric_type_str_to_dist_func(),
+            with_dist=True,
+            topk=query.similarity_top_k,
+            output_column_names=[
+                self._primary_field,
+                self._text_field,
+                self._metadata_field
+            ],
+            where_clause=[text(filter)] if filter is not None else None,
+        )
+
+        return [
+            DBEmbeddingRow(
+                node_id=r[0],
+                text=r[1],
+                metadata=(json.loads(r[2]) if not isinstance(r[2], dict) else r[2]),
+                similarity=self._parse_distance_to_similarities(r[3])
+            )
+            for r in res.fetchall()
+        ]
+
     def _sparse_search(self, query: VectorStoreQuery, **kwargs: Any) -> List[DBEmbeddingRow]:
         """Perform BM25 full-text search."""
         if query.filters is not None:
@@ -659,6 +925,37 @@ class GaussVectorStore(BasePydanticVectorStore):
             filter = None
 
         res = self._client.bm25_search(
+            table_name=self._table_name,
+            search_text=query.query_str,
+            column_name=self._text_field,
+            with_score=True,
+            topk=query.sparse_top_k,
+            output_column_names=[
+                self._primary_field,
+                self._text_field,
+                self._metadata_field
+            ],
+            where_clause=[text(filter)] if filter is not None else None,
+        )
+
+        return [
+            DBEmbeddingRow(
+                node_id=r[0],
+                text=r[1],
+                metadata=(json.loads(r[2]) if not isinstance(r[2], dict) else r[2]),
+                similarity=r[3]
+            )
+            for r in res.fetchall()
+        ]
+
+    async def _asparse_search(self, query: VectorStoreQuery, **kwargs: Any) -> List[DBEmbeddingRow]:
+        """Asynchronously perform BM25 full-text search."""
+        if query.filters is not None:
+            filter = self._to_gauss_filter(query.filters)
+        else:
+            filter = None
+
+        res = await self._aclient.bm25_search(
             table_name=self._table_name,
             search_text=query.query_str,
             column_name=self._text_field,
@@ -692,8 +989,21 @@ class GaussVectorStore(BasePydanticVectorStore):
         results = dense_result + sparse_result
         return self._dedup_results(results)
 
+    async def _ahybrid_search(self, query: VectorStoreQuery, **kwargs: Any) -> List[DBEmbeddingRow]:
+        """Asynchronously perform hybrid search."""
+        if query.alpha is not None:
+            logger.warning("GaussDB hybrid search does not support alpha parameter.")
+
+        dense_result = await self._adefault_search(query, **kwargs)
+        sparse_result = await self._asparse_search(query, **kwargs)
+        results = dense_result + sparse_result
+        return self._dedup_results(results)
+
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         """Query vector store."""
+        if self._client is None:
+            raise ValueError("Client should be initialized.")
+
         if query.mode == VectorStoreQueryMode.DEFAULT:
             results = self._default_search(query, **kwargs)
         elif query.mode in [
@@ -707,6 +1017,31 @@ class GaussVectorStore(BasePydanticVectorStore):
             if self._enable_sparse is False:
                 raise ValueError(f"The query mode {query.mode} requires sparse, but enable_sparse is False.")
             results = self._hybrid_search(query, **kwargs)
+        else:
+            raise ValueError(f"GaussDB does not support {query.mode} yet.")
+
+        return self._db_rows_to_query_result(results)
+
+    async def aquery(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        """Asynchronously query vector store."""
+        if self._aclient is None:
+            raise ValueError("Async client should be initialized.")
+
+        await self._async_init()
+
+        if query.mode == VectorStoreQueryMode.DEFAULT:
+            results = await self._adefault_search(query, **kwargs)
+        elif query.mode in [
+            VectorStoreQueryMode.SPARSE,
+            VectorStoreQueryMode.TEXT_SEARCH
+        ]:
+            if self._enable_sparse is False:
+                raise ValueError(f"The query mode {query.mode} requires sparse, but enable_sparse is False.")
+            results = await self._asparse_search(query, **kwargs)
+        elif query.mode == VectorStoreQueryMode.HYBRID:
+            if self._enable_sparse is False:
+                raise ValueError(f"The query mode {query.mode} requires sparse, but enable_sparse is False.")
+            results = await self._ahybrid_search(query, **kwargs)
         else:
             raise ValueError(f"GaussDB does not support {query.mode} yet.")
 
